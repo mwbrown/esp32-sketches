@@ -62,6 +62,7 @@ class PacketStats(object):
 
 def process_file(filename):
 
+    print('---------------------------------')
     print('Analyzing %s...' % (filename))
     with open(filename, 'rb') as f:
 
@@ -75,13 +76,19 @@ def process_file(filename):
         stats = PacketStats(packet_info)
         print('pop. size:', stats.pop_size)
         print('min:      ', stats.min)
-        print('max:      ', stats.max)
-        print('midrange: ', stats.midrange)
         print('mean:     ', stats.mean)
+        print('max:      ', stats.max)
+        print('')
+        print('midrange: ', stats.midrange)
+        print('mean-min: ', stats.mean - stats.min)
+        print('max-mean: ', stats.max - stats.mean)
+        print('')
         print('median:   ', stats.median)
         print('mode:     ', stats.mode)
         print('variance: ', stats.variance)
         print('std. dev: ', stats.std_dev)
+        print('')
+        print('---------------------------------')
         print('')
 
 def main():
