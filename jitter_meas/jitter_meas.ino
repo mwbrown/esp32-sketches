@@ -15,9 +15,6 @@
 // Uncomment this to enable printing out stats every second.
 // #define ENABLE_SERIAL_STATS
 
-// Uncomment this to enable task notifications instead of a polling loop.
-#define ENABLE_HTTP_TASK_NOTIF
-
 const int measPin = 22;
 
 static void http_task(void *arg);
@@ -76,8 +73,9 @@ typedef struct hw_timer_s {
 // End timer.h copy
 //
 
-#define RINGBUF_LEN (1024*8)
-#define RINGBUF_PKT_SIZE 256
+#define RINGBUF_LEN           (1024*8)  /**< The number of 32-bit samples in the sample buffer. */
+#define RINGBUF_MAX_PKT_SIZE  256       /**< The sample size at which a message MUST be sent. */
+#define RINGBUF_MAX_WAIT_MS   500       /**< The maximum wait interval before a packet is forced to be sent. */
 
 typedef struct ringbuf_s {
   size_t idx_r;
@@ -141,21 +139,14 @@ void IRAM_ATTR clockInputIsr()
   ticked = true;
   lastTick = timerVal;
 
-#ifdef ENABLE_HTTP_TASK_NOTIF
-
-  if ((ringbuf.count >= RINGBUF_PKT_SIZE) && (httpTaskHandle != 0))
+  if ((ringbuf.count >= RINGBUF_MAX_PKT_SIZE) && (httpTaskHandle != 0))
   {
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     vTaskNotifyGiveFromISR(httpTaskHandle, &xHigherPriorityTaskWoken);
   }
 
-#endif
-
   portEXIT_CRITICAL_ISR(&ringbuf_lock);
-
-#ifdef ENABLE_HTTP_TASK_NOTIF
   portYIELD_FROM_ISR();
-#endif
 }
 
 void setup() {
@@ -203,8 +194,8 @@ void loop() {
 
 static void http_task(void *arg) {
   WiFiUDP udp;
-  uint32_t sampleBuf[256];
-  uint32_t numSamples = 256;
+  uint32_t sampleBuf[RINGBUF_MAX_PKT_SIZE];
+  TickType_t waitTime = pdMS_TO_TICKS(RINGBUF_MAX_WAIT_MS);
 
   memset(sampleBuf, 0, sizeof(sampleBuf));
 
@@ -225,34 +216,23 @@ static void http_task(void *arg) {
     size_t to_read = 0;
     size_t count;
 
-#ifdef ENABLE_HTTP_TASK_NOTIF
-
-    if (ulTaskNotifyTake(pdTRUE, portMAX_DELAY) != 1)
+    if (ulTaskNotifyTake(pdTRUE, waitTime) != 1)
     {
-      // Wait timed out on task notification
-      continue;
+      /* Wait timed out. Check for the number of samples anyway. */
     }
 
-#else
-
-    delay(100);
-
-    /* Determine how much data is available in the ring buffer. */
+    /* Check for the number of samples. */
     portENTER_CRITICAL(&ringbuf_lock);
     count = ringbuf.count;
     portEXIT_CRITICAL(&ringbuf_lock);
 
-    /* Don't bother if the packet is too small. */
-    if (count < RINGBUF_PKT_SIZE)
+    if (count == 0)
     {
       continue;
     }
-#endif
-
-    // TODO: add support for other packet sizes (min/max range)
 
     /* Calculate our pointers, and copy the data. */
-    to_read = RINGBUF_PKT_SIZE; // 256
+    to_read = count < RINGBUF_MAX_PKT_SIZE ? count : RINGBUF_MAX_PKT_SIZE;
     if ((RINGBUF_LEN - ringbuf.idx_r) < to_read)
     {
       const size_t first_copy = RINGBUF_LEN - ringbuf.idx_r;
@@ -283,7 +263,7 @@ static void http_task(void *arg) {
     portEXIT_CRITICAL(&ringbuf_lock);
 
     udp.beginPacket(udpAddr, udpPort);
-    udp.write((uint8_t *)sampleBuf, sizeof(uint32_t) * numSamples);
+    udp.write((uint8_t *)sampleBuf, sizeof(uint32_t) * to_read);
     udp.endPacket();
   }
 }
