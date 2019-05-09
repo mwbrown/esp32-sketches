@@ -96,23 +96,24 @@ static TaskHandle_t httpTaskHandle;
 #ifdef ENABLE_SERIAL_STATS
 volatile uint32_t num_interrupts;
 volatile uint32_t num_dropped;
+volatile uint32_t num_weird;
 #endif
 
 void IRAM_ATTR clockInputIsr()
 {
-  portENTER_CRITICAL_ISR(&ringbuf_lock);
-
-#ifdef ENABLE_SERIAL_STATS
-  num_interrupts++;
-#endif
-
-
   // The next four lines are the contents of timerRead(), copied here because
   // timerRead() is not marked IRAM_ATTR and thus crashes if called from an ISR.
   timer->dev->update = 1;
   uint64_t timerHi = timer->dev->cnt_high;
   uint64_t timerLo = timer->dev->cnt_low;
   uint64_t timerVal = (timerHi << 32) | timerLo;
+  uint64_t delta = timerVal - lastTick;
+
+  portENTER_CRITICAL_ISR(&ringbuf_lock);
+
+#ifdef ENABLE_SERIAL_STATS
+  num_interrupts++;
+#endif
 
   // The first clock pulse will be bogus, so ignore it.
   if (ticked)
@@ -120,7 +121,15 @@ void IRAM_ATTR clockInputIsr()
     // Put the sample into the ring buffer.
     if (ringbuf.count < RINGBUF_LEN)
     {
-      ringbuf.data[ringbuf.idx_w++] = (uint32_t)(timerVal - lastTick);
+#ifdef ENABLE_SERIAL_STATS
+      // This is a smaller threshold than a single 32k clock tick... something is wrong
+      if(delta < 300)
+      {
+        num_weird++;
+      }
+#endif
+
+      ringbuf.data[ringbuf.idx_w++] = delta;
       ringbuf.count++;
 
       if (ringbuf.idx_w == RINGBUF_LEN)
@@ -178,14 +187,17 @@ void loop() {
   uint32_t nisr;
   uint32_t ndrp;
   uint32_t count;
+  uint32_t weird;
 
   portENTER_CRITICAL(&ringbuf_lock);
   nisr = num_interrupts;
   ndrp = num_dropped;
+  weird = num_weird;
   count = ringbuf.count;
   portEXIT_CRITICAL(&ringbuf_lock);
 
-  Serial.printf("%d [%d] (%d)\n", nisr, ndrp, count);
+  //Serial.printf("%d [%d] (%d)\n", nisr, ndrp, count);
+  Serial.printf("%d %d\n", nisr, weird);
 
 #endif
 
