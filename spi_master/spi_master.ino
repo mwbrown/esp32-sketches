@@ -231,6 +231,7 @@ static void spi_poll_task(void *arg)
                     {
                         if (fspi_handle_master_tx_req(msg.data.txBuf.data, msg.data.txBuf.len))
                         {
+                            Serial.printf("tx req succ\n");
                             /* This buffer was malloced earlier. */
                             free(msg.data.txBuf.data);
                         }
@@ -548,12 +549,15 @@ static bool fspi_handle_master_tx_req(const uint8_t *buf, size_t len)
     spi_next_txn.tx_buffer = spi_frame_buf;
     spi_next_txn.rx_buffer = spi_rx_buf;
 
+// TODO: critical section here
+
     /* Last chance to bail out of this transaction. */
     if (READ_SRDY() != 0)
     {
         /* SRDY is still valid. */
         ASSERT_MRDY();
         spiState = FSPI_STATE_MASTER_TX_REQ;
+        return true;
     }
     else
     {
