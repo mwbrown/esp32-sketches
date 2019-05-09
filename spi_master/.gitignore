@@ -1,0 +1,7 @@
+# Ignore secrets file
+local_wifi_config.h
+
+# Ignore compiled python and .pkt output files
+*.pkt
+*.pyc
+**/__pycache__
