@@ -490,6 +490,7 @@ static void fspi_handle_slave_tx_req(void)
         }
     }
 
+    spiState = FSPI_STATE_IDLE;
     DEASSERT_MRDY();
 }
 
