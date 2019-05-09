@@ -545,6 +545,8 @@ static void fspi_handle_srdy_ack(void)
 
 static bool fspi_handle_master_tx_req(const uint8_t *buf, size_t len)
 {
+    unsigned lock;
+
     if (!fspi_make_frame(buf, len))
     {
         return false;
@@ -561,23 +563,23 @@ static bool fspi_handle_master_tx_req(const uint8_t *buf, size_t len)
     spi_next_txn.tx_buffer = spi_frame_buf;
     spi_next_txn.rx_buffer = spi_rx_buf;
 
-// TODO: critical section begin
+    /* Enter a critical section in between reading SRDY and a potential
+       write to the MRDY line. */
+    lock = portENTER_CRITICAL_NESTED();
 
     /* Last chance to bail out of this transaction. */
     if (READ_SRDY() != 0)
     {
         /* SRDY is still valid. */
         ASSERT_MRDY();
-
-// TODO: critical section end
+        portEXIT_CRITICAL_NESTED(lock);
 
         spiState = FSPI_STATE_MASTER_TX_REQ;
         return true;
     }
     else
     {
-
-// TODO: critical section end
+        portEXIT_CRITICAL_NESTED(lock);
 
         /* Set the event just in case (probably unnecessary). */
         xEventGroupSetBits(spiEvtGroup, SPI_THREAD_EVENT_SRDY_LOW);
