@@ -25,6 +25,9 @@ static void spi_pre_cb(spi_transaction_t *trans);
 static void spi_post_cb(spi_transaction_t *trans);
 static void spi_srdy_pin_isr(void *arg);
 
+/* Helper functions for the framed-SPI protocol. */
+static uint8_t fspi_calc_fcs(const uint8_t *buf, size_t len);
+
 /* Slave TX state machine related functions. */
 static void fspi_handle_slave_tx_req(void);
 static bool fspi_perform_slave_header_read(void);
@@ -39,20 +42,13 @@ static void fspi_transmit_master_frame(void);
 /* Helper functions to interact with the SPI thread. */
 static void send_master_tx_req(const uint8_t *buf, size_t len);
 
-// Secrets file to define WIFI_NAME, WIFI_PASS, UDP_DEST, and optionally UDP_PORT.
-#include "local_wifi_config.h"
-
-#ifndef UDP_PORT
-#define UDP_PORT 37250
-#endif
-
 #define SPI_PIN_SCK         GPIO_NUM_16
 #define SPI_PIN_MOSI        GPIO_NUM_17
 #define SPI_PIN_MISO        GPIO_NUM_5
 #define SPI_PIN_MRDY        GPIO_NUM_18
 #define SPI_PIN_SRDY        GPIO_NUM_19
 
-/* Returns 0 or 1 depending on SRDY's actual signal state. */
+/* Returns 0 or 1 depending on SRDY's actual signal state (as opposed to active-low asserted/deasserted). */
 #define READ_SRDY()         ((GPIO.in >> SPI_PIN_SRDY) & 1)
 
 /* Sets MRDY low. */
@@ -61,12 +57,15 @@ static void send_master_tx_req(const uint8_t *buf, size_t len);
 /* Sets MRDY high. */
 #define DEASSERT_MRDY()     do { GPIO.out_w1ts = (1 << SPI_PIN_MRDY); } while(0)
 
-#define MAX_SPI_FRAME_PAYLOAD 253
-#define SPI_FRAME_OVERHEAD 3
+/* Max total transmission size is 256 bytes. Framing accounts for SOF, LEN, and FCS. */
+#define MAX_SPI_FRAME_PAYLOAD       253
+#define SPI_FRAME_OVERHEAD          3
 
-#define SPI_CMD_QUEUE_LEN 1
+/* For now, we are only using the command queue as a TX queue (this will likely change to be a non-RTOS TX linked-list). */
+#define SPI_CMD_QUEUE_LEN           1
 
-#define FSPI_START_OF_FRAME 0xFE
+/* All frames denoted by {0xFE, len, payload[len], fcs}. */
+#define FSPI_START_OF_FRAME         0xFE
 
 /* This is the agreed-upon delay (in usec) that the master should wait before clocking bytes from the slave. */
 #define MRDY_TO_SCK_SLAVE_TX_DELAY  30
@@ -76,12 +75,6 @@ static void send_master_tx_req(const uint8_t *buf, size_t len);
 
 /* Defines the interval at which the SRDY line is checked while waiting for an ack to complete. */
 #define SRDY_ACK_PULSE_CHECK        5
-
-const char *wifiName = WIFI_NAME;
-const char *wifiPass = WIFI_PASS;
-
-const char *udpAddr = UDP_DEST;
-const int   udpPort = UDP_PORT;
 
 #define SPI_THREAD_EVENT_SRDY_LOW 0x00000001
 #define SPI_THREAD_EVENT_MSG_RECV 0x00000002
@@ -99,7 +92,7 @@ typedef enum {
 } FramedSpiState_t;
 
 typedef enum {
-    SPI_MSG_TYPE_TX_BUF,    /**< Request to send a message. */
+    SPI_MSG_TYPE_TX_BUF,        /**< Request to send a message. */
 } SpiCmdMsgType_t;
 
 typedef struct {
@@ -120,13 +113,10 @@ static EventGroupHandle_t spiEvtGroup;
 
 static volatile FramedSpiState_t spiState = FSPI_STATE_IDLE;
 
-const uint8_t spiTestFrame[] = {
-    0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x12, 0x34, 0x56, 0x78
-};
-
 static uint8_t           spi_frame_buf[256];
 static size_t            spi_frame_buf_len;
 static uint8_t           spi_rx_buf[256];
+
 static spi_transaction_t spi_next_txn;
 
 void setup() {
@@ -294,7 +284,7 @@ const spi_device_interface_config_t spiDevCfg = {
 };
 
 // Sets up HSPI in master mode.
-esp_err_t spi_setup(void)
+static esp_err_t spi_setup(void)
 {
     esp_err_t err;
 
@@ -311,8 +301,8 @@ esp_err_t spi_setup(void)
 
     // TODO: check if SRDY is already low?
 
-    // Configure HSPI / SPI2 as our master SPI bus, no DMA
-    err = spi_bus_initialize(HSPI_HOST, &spiCfg, 0);
+    // Configure HSPI / SPI2 as our master SPI bus, DMA channel 1
+    err = spi_bus_initialize(HSPI_HOST, &spiCfg, 1);
     if (err != ESP_OK)
     {
         Serial.printf("spi_bus_initialize err\n");
@@ -335,22 +325,17 @@ esp_err_t spi_setup(void)
 
 static void IRAM_ATTR spi_pre_cb(spi_transaction_t *trans)
 {
-
 }
 
 static void IRAM_ATTR spi_post_cb(spi_transaction_t *trans)
 {
-    //GPIO.out_w1ts = (1 << SPI_PIN_MRDY);
 }
 
-static bool fspi_make_frame(const uint8_t *buf, size_t len)
+/* Calculates the FCS byte for a payload (not including any framing, incl. len byte).
+   NOTE: Does not perform length check on the buffer, that is up to the framing protocol. */
+static uint8_t fspi_calc_fcs(const uint8_t *buf, size_t len)
 {
-
     uint8_t fcs;
-
-    if (len > MAX_SPI_FRAME_PAYLOAD) {
-        return false;
-    }
 
     /* Calculate the FCS which is just XOR of len and all buf bytes. */
     fcs = len;
@@ -358,6 +343,21 @@ static bool fspi_make_frame(const uint8_t *buf, size_t len)
     {
         fcs ^= buf[i];
     }
+
+    return fcs;
+}
+
+/* Takes a user payload of up to MAX_SPI_FRAME_PAYLOAD and copies it into the
+   frame buffer (i.e. spi_frame_buf), with appropriate framing bytes. */
+static bool fspi_make_frame(const uint8_t *buf, size_t len)
+{
+    uint8_t fcs;
+
+    if (len > MAX_SPI_FRAME_PAYLOAD) {
+        return false;
+    }
+
+    fcs = fspi_calc_fcs(buf, len);
 
     /* Fill out the entire buffer. */
     spi_frame_buf[0] = FSPI_START_OF_FRAME;
@@ -376,6 +376,7 @@ static void IRAM_ATTR spi_srdy_pin_isr(void *arg)
     BaseType_t xHigherPriorityTaskWoken;
     uint32_t state = READ_SRDY();
 
+    /* The task may be waiting for a pin interrupt, so trigger it to wake up. */
     if (!state)
     {
         xEventGroupSetBitsFromISR(spiEvtGroup, SPI_THREAD_EVENT_SRDY_LOW, &xHigherPriorityTaskWoken);
@@ -390,7 +391,6 @@ static void IRAM_ATTR spi_srdy_pin_isr(void *arg)
 static bool fspi_perform_slave_header_read(void)
 {
     int attempts = 10;
-    spiState = FSPI_STATE_SLAVE_TX_HDR;
 
     memset(spi_frame_buf, 0, sizeof(spi_frame_buf));
 
@@ -451,6 +451,8 @@ static bool fspi_perform_slave_header_read(void)
 
 static bool fspi_perform_slave_payload_read(void)
 {
+    esp_err_t err;
+
     /* We will need to read both the payload and final FCS byte. */
     uint8_t payload_size = spi_rx_buf[1];
 
@@ -463,9 +465,9 @@ static bool fspi_perform_slave_payload_read(void)
     spi_next_txn.tx_buffer = spi_frame_buf;
     spi_next_txn.rx_buffer = &spi_rx_buf[2];
 
-    if (spi_device_polling_transmit(spiDevice, &spi_next_txn) != ESP_OK)
+    if ((err = spi_device_polling_transmit(spiDevice, &spi_next_txn)) != ESP_OK)
     {
-        Serial.printf("slave payload fail\n");
+        Serial.printf("slave payload fail %d\n", err);
         return false;
     }
 
@@ -475,18 +477,30 @@ static bool fspi_perform_slave_payload_read(void)
 static void fspi_handle_slave_tx_req(void)
 {
     /* Assert MRDY. */
+    spiState = FSPI_STATE_SLAVE_TX_HDR;
     ASSERT_MRDY();
 
     /* Wait for the appropriate time before initiating the transaction. */
     ets_delay_us(MRDY_TO_SCK_SLAVE_TX_DELAY);
 
+    /* Determine how many bytes the slave wants to send us. */
     if (fspi_perform_slave_header_read())
     {
+        /* Update our state and read the payload. */
+        spiState = FSPI_STATE_SLAVE_TX_PYLD;
         if (fspi_perform_slave_payload_read())
         {
-            // TODO: verify checksum
+            uint8_t len         = spi_rx_buf[1];
+            const uint8_t *pyld = &spi_rx_buf[2];
+            uint8_t fcs_recv    = spi_rx_buf[len + 2];
+            uint8_t fcs_calc    = fspi_calc_fcs(pyld, len);
 
-            Serial.printf("Slave TX'd %d bytes\n", spi_rx_buf[1]);
+            Serial.printf("Slave TX'd %d bytes, fcs %s\n", len, (fcs_recv == fcs_calc) ? "good" : "bad");
+
+            // TODO: This is where the user callback would go with the received data (pyld/len) from the slave.
+
+            //xxx in this case, just mirror the bytes back over the SPI line.
+            send_master_tx_req(pyld, len);
         }
     }
 
@@ -503,7 +517,6 @@ static void fspi_handle_srdy_ack(void)
 
     while (READ_SRDY() == 0)
     {
-#if 0
         if (totalWait >= MAX_SLAVE_SRDY_ACK_PULSE)
         {
             Serial.printf("slave race 2\n");
@@ -514,7 +527,6 @@ static void fspi_handle_srdy_ack(void)
 
         totalWait += SRDY_ACK_PULSE_CHECK;
         ets_delay_us(SRDY_ACK_PULSE_CHECK);
-#endif
     }
 
     /* Did we lose a signalling race here? */
@@ -543,24 +555,30 @@ static bool fspi_handle_master_tx_req(const uint8_t *buf, size_t len)
     spi_next_txn.flags = 0;
     spi_next_txn.cmd = 0;
     spi_next_txn.addr = 0;
-    spi_next_txn.length = (sizeof(spiTestFrame) + SPI_FRAME_OVERHEAD) * 8;
+    spi_next_txn.length = (len + SPI_FRAME_OVERHEAD) * 8;
     spi_next_txn.rxlength = 0;
     spi_next_txn.user = 0;
     spi_next_txn.tx_buffer = spi_frame_buf;
     spi_next_txn.rx_buffer = spi_rx_buf;
 
-// TODO: critical section here
+// TODO: critical section begin
 
     /* Last chance to bail out of this transaction. */
     if (READ_SRDY() != 0)
     {
         /* SRDY is still valid. */
         ASSERT_MRDY();
+
+// TODO: critical section end
+
         spiState = FSPI_STATE_MASTER_TX_REQ;
         return true;
     }
     else
     {
+
+// TODO: critical section end
+
         /* Set the event just in case (probably unnecessary). */
         xEventGroupSetBits(spiEvtGroup, SPI_THREAD_EVENT_SRDY_LOW);
 
