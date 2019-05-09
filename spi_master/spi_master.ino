@@ -168,7 +168,6 @@ void setup() {
 void loop()
 {
     delay(1000);
-    send_master_tx_req(spiTestFrame, sizeof(spiTestFrame));
 }
 
 static void spi_poll_task(void *arg)
