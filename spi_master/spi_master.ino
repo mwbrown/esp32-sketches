@@ -24,6 +24,7 @@ static void spi_poll_task(void *arg);
 static void spi_pre_cb(spi_transaction_t *trans);
 static void spi_post_cb(spi_transaction_t *trans);
 static void spi_srdy_pin_isr(void *arg);
+static void gpio_pair_pin_isr(void *arg);
 
 /* Helper functions for the framed-SPI protocol. */
 static uint8_t fspi_calc_fcs(const uint8_t *buf, size_t len);
@@ -47,6 +48,8 @@ static void send_master_tx_req(const uint8_t *buf, size_t len);
 #define SPI_PIN_MISO        GPIO_NUM_5
 #define SPI_PIN_MRDY        GPIO_NUM_18
 #define SPI_PIN_SRDY        GPIO_NUM_19
+
+#define GPIO_PIN_PAIR       GPIO_NUM_26
 
 /* Returns 0 or 1 depending on SRDY's actual signal state (as opposed to active-low asserted/deasserted). */
 #define READ_SRDY()         ((GPIO.in >> SPI_PIN_SRDY) & 1)
@@ -78,10 +81,12 @@ static void send_master_tx_req(const uint8_t *buf, size_t len);
 
 #define SPI_THREAD_EVENT_SRDY_LOW 0x00000001
 #define SPI_THREAD_EVENT_MSG_RECV 0x00000002
+#define SPI_THREAD_EVENT_PAIR_LOW 0x00000004
 
 const EventBits_t SPI_THREAD_EVENT_ALL =
     SPI_THREAD_EVENT_SRDY_LOW |
-    SPI_THREAD_EVENT_MSG_RECV ;
+    SPI_THREAD_EVENT_MSG_RECV |
+    SPI_THREAD_EVENT_PAIR_LOW ;
 
 typedef enum {
     FSPI_STATE_IDLE,            /**< Waiting for either local TX request or slave to lower SRDY. */
@@ -195,6 +200,21 @@ static void spi_poll_task(void *arg)
                 }
             }
 
+            if (evt & SPI_THREAD_EVENT_PAIR_LOW)
+            {
+                if (spiState == FSPI_STATE_IDLE)
+                {
+                    uint8_t buf[32];
+
+                    for(int i = 0; i < sizeof(buf); i++)
+                    {
+                        buf[i] = 0x80 + i;
+                    }
+
+                    fspi_handle_master_tx_req(buf, sizeof(buf));
+                }
+            }
+
             /* FIXME: we shouldn't rely on an event being set here. Just peek the queue if we're idle to see
                       if there is anything left to send. */
 
@@ -255,6 +275,14 @@ const gpio_config_t gpioCfg_mrdy = {
     .intr_type    = GPIO_INTR_DISABLE,
 };
 
+const gpio_config_t gpioCfg_pair = {
+    .pin_bit_mask = (1 << GPIO_PIN_PAIR),
+    .mode         = GPIO_MODE_INPUT,
+    .pull_up_en   = GPIO_PULLUP_ENABLE,
+    .pull_down_en = GPIO_PULLDOWN_DISABLE,
+    .intr_type    = GPIO_INTR_NEGEDGE,
+};
+
 const spi_bus_config_t spiCfg = {
     .mosi_io_num     = SPI_PIN_MOSI,
     .miso_io_num     = SPI_PIN_MISO,
@@ -296,8 +324,11 @@ static esp_err_t spi_setup(void)
     gpio_config(&gpioCfg_mrdy);
     gpio_set_level(SPI_PIN_MRDY, 1);
 
-    gpio_config(&gpioCfg_srdy);
     gpio_isr_handler_add(SPI_PIN_SRDY, spi_srdy_pin_isr, NULL);
+    gpio_config(&gpioCfg_srdy);
+
+    gpio_isr_handler_add(GPIO_PIN_PAIR, gpio_pair_pin_isr, NULL);
+    gpio_config(&gpioCfg_pair);
 
     // TODO: check if SRDY is already low?
 
@@ -385,6 +416,19 @@ static void IRAM_ATTR spi_srdy_pin_isr(void *arg)
         {
             portYIELD_FROM_ISR();
         }
+    }
+}
+
+static void IRAM_ATTR gpio_pair_pin_isr(void *arg)
+{
+    BaseType_t xHigherPriorityTaskWoken;
+
+    /* The task may be waiting for a pin interrupt, so trigger it to wake up. */
+    xEventGroupSetBitsFromISR(spiEvtGroup, SPI_THREAD_EVENT_PAIR_LOW, &xHigherPriorityTaskWoken);
+
+    if (xHigherPriorityTaskWoken)
+    {
+        portYIELD_FROM_ISR();
     }
 }
 
